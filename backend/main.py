@@ -1,414 +1,337 @@
-from dotenv import load_dotenv
-load_dotenv()
-
-from fastapi import FastAPI, HTTPException, Header, Query
+from fastapi import FastAPI, HTTPException, Depends, Header, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from typing import Optional
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel
+from typing import List, Optional, Union
+import os
+import uvicorn
+from datetime import datetime, timedelta
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, ForeignKey
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session
+import os
+from dotenv import load_dotenv
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi.middleware.cors import CORSMiddleware
 import qrcode
 from io import BytesIO
 import base64
-from models import Vehicle, VehicleCreate, VehicleUpdate, User, UserCreate, LoginRequest
-from database import get_db, get_sa_conn, init_db
-import os
-from PIL import Image, ImageDraw, ImageFont
-import textwrap
-import uuid
-from datetime import datetime
-from passlib.hash import bcrypt
-from sqlalchemy import text
+import secrets
+import string
+import random
+from typing import List, Optional
 
-app = FastAPI(title="Estate Vehicle Gate Pass")
+# Load environment variables
+load_dotenv()
 
-# =============================================
-# CORS — configurable via environment
-# =============================================
-cors_env = os.getenv("CORS_ALLOWED_ORIGINS")
-if cors_env:
-    # Comma-separated list in env, e.g. "https://app.squard24.com,http://localhost:3001"
-    allowed_origins = [o.strip() for o in cors_env.split(",") if o.strip()]
-else:
-    # Default: live frontend + local dev
-    allowed_origins = [
-        "https://app.squard24.com",     # Live frontend
-        "http://localhost:3001",        # Local dev
-        "http://127.0.0.1:3001",
-    ]
+# Database setup
+SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./vehicles.db")
+engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False} if SQLALCHEMY_DATABASE_URL.startswith("sqlite") else {})
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
 
-# Optional: single extra origin
-frontend_origin = os.getenv("FRONTEND_ORIGIN")
-if frontend_origin:
-    allowed_origins.append(frontend_origin)
+# Models
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String, unique=True, index=True)
+    password_hash = Column(String)
+    role = Column(String, default="guard")
+    first_name = Column(String, nullable=True)
+    last_name = Column(String, nullable=True)
+    active = Column(Boolean, default=True)
 
+class Vehicle(Base):
+    __tablename__ = "vehicles"
+    id = Column(String, primary_key=True, index=True)
+    make = Column(String)
+    model = Column(String)
+    year = Column(Integer)
+    color = Column(String)
+    plate_number = Column(String, unique=True, index=True)
+    owner_name = Column(String)
+    owner_phone = Column(String)
+    status = Column(String, default="active")  # active, inactive, flagged
+    created_at = Column(DateTime, default=datetime.utcnow)
+    last_checked_in = Column(DateTime, nullable=True)
+    notes = Column(String, nullable=True)
+
+# Create tables
+Base.metadata.create_all(bind=engine)
+
+# Pydantic models
+class UserBase(BaseModel):
+    username: str
+    role: Optional[str] = "guard"
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+
+class UserCreate(UserBase):
+    password: str
+
+class UserInDB(UserBase):
+    id: int
+    active: bool
+
+    class Config:
+        orm_mode = True
+
+class VehicleBase(BaseModel):
+    make: str
+    model: str
+    year: int
+    color: str
+    plate_number: str
+    owner_name: str
+    owner_phone: str
+    status: Optional[str] = "active"
+    notes: Optional[str] = None
+
+class VehicleCreate(VehicleBase):
+    pass
+
+class VehicleInDB(VehicleBase):
+    id: str
+    created_at: datetime
+    last_checked_in: Optional[datetime] = None
+
+    class Config:
+        orm_mode = True
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+class TokenData(BaseModel):
+    username: Optional[str] = None
+    role: Optional[str] = None
+
+# Security
+SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
+# FastAPI app
+app = FastAPI()
+
+# CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins,
+    allow_origins=["http://100.99.151.65:3005", "http://localhost:3005"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Initialize database on startup
-@app.on_event("startup")
-def on_startup():
-    init_db()
-    print("Database ready!")
+# Mount static files
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
-# =============================================
-# AUTH & USER MANAGEMENT
-# =============================================
+# Templates
+templates = Jinja2Templates(directory="templates")
 
-
-@app.post("/api/login")
-def login(payload: LoginRequest):
-    """Simple username/password login backed by the users table.
-
-    Returns username and role so the frontend can store them in localStorage.
-    """
-    with get_sa_conn() as conn:
-        result = conn.execute(
-            text(
-                "SELECT id, username, password_hash, role, active "
-                "FROM users WHERE username = :username"
-            ),
-            {"username": payload.username},
-        )
-        row = result.first()
-        if not row:
-            raise HTTPException(status_code=401, detail="Invalid credentials")
-
-        active = bool(row[4])
-        if not active:
-            raise HTTPException(status_code=403, detail="User is inactive")
-
-        password_hash = row[2]
-        if not bcrypt.verify(payload.password, password_hash):
-            raise HTTPException(status_code=401, detail="Invalid credentials")
-
-        return {"username": row[1], "role": row[3]}
-
-
-@app.get("/api/users")
-def list_users(x_role: str | None = Header(default=None)):
-    """List all users (admin-only). Password hashes are never returned."""
-    if x_role != "admin":
-        raise HTTPException(status_code=403, detail="Admin role required")
-
-    with get_sa_conn() as conn:
-        result = conn.execute(
-            text(
-                "SELECT id, username, role, active, first_name, last_name "
-                "FROM users ORDER BY created_at ASC"
-            )
-        )
-        users = [
-            {
-                "id": row[0],
-                "username": row[1],
-                "role": row[2],
-                "active": bool(row[3]),
-                "first_name": row[4],
-                "last_name": row[5],
-            }
-            for row in result.fetchall()
-        ]
-    return {"items": users}
-
-
-@app.post("/api/users")
-def create_user(user: UserCreate, x_role: str | None = Header(default=None)):
-    """Create a new user (typically a guard). Admin-only."""
-    if x_role != "admin":
-        raise HTTPException(status_code=403, detail="Admin role required")
-
-    password_hash = bcrypt.hash(user.password)
-
+# Dependency to get DB session
+def get_db():
+    db = SessionLocal()
     try:
-        with get_sa_conn() as conn:
-            conn.execute(
-                text(
-                    "INSERT INTO users (username, password_hash, role, first_name, last_name, active) "
-                    "VALUES (:username, :password_hash, :role, :first_name, :last_name, 1)"
-                ),
-                {
-                    "username": user.username,
-                    "password_hash": password_hash,
-                    "role": user.role,
-                    "first_name": user.first_name,
-                    "last_name": user.last_name,
-                },
-            )
-            result = conn.execute(
-                text(
-                    "SELECT id, username, role, active, first_name, last_name "
-                    "FROM users WHERE username = :username"
-                ),
-                {"username": user.username},
-            )
-            row = result.first()
-            return {
-                "id": row[0],
-                "username": row[1],
-                "role": row[2],
-                "active": bool(row[3]),
-                "first_name": row[4],
-                "last_name": row[5],
-            }
-    except Exception as e:
-        # Likely a unique constraint violation on username
-        raise HTTPException(status_code=400, detail="Could not create user: " + str(e))
+        yield db
+    finally:
+        db.close()
 
+# Security functions
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
 
-@app.patch("/api/users/{user_id}/toggle")
-def toggle_user(user_id: int, x_role: str | None = Header(default=None)):
-    """Activate/deactivate a user account (admin-only)."""
-    if x_role != "admin":
-        raise HTTPException(status_code=403, detail="Admin role required")
+def get_password_hash(password):
+    return pwd_context.hash(password)
 
-    with get_sa_conn() as conn:
-        result = conn.execute(
-            text("SELECT active FROM users WHERE id = :id"),
-            {"id": user_id},
-        )
-        row = result.first()
-        if not row:
-            raise HTTPException(status_code=404, detail="User not found")
-        current_active = bool(row[0])
-        new_active = 0 if current_active else 1
-        conn.execute(
-            text("UPDATE users SET active = :active WHERE id = :id"),
-            {"active": new_active, "id": user_id},
-        )
+def get_user(db, username: str):
+    return db.query(User).filter(User.username == username).first()
 
-        return {"id": user_id, "active": bool(new_active)}
+def authenticate_user(db, username: str, password: str):
+    user = get_user(db, username)
+    if not user:
+        return False
+    if not verify_password(password, user.password_hash):
+        return False
+    return user
 
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
 
-# =============================================
-# VEHICLE & QR ENDPOINTS
-# =============================================
-
-@app.post("/api/vehicles")
-def create_vehicle(vehicle: VehicleCreate, x_role: str | None = Header(default=None)):
-    # Admins and guards can add vehicles
-    if x_role not in ("admin", "user", "guard"):
-        raise HTTPException(status_code=403, detail="Admin or guard role required")
+async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+    credentials_exception = HTTPException(
+        status_code=401,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
     try:
-        new_id = vehicle.id or ("VEH-" + uuid.uuid4().hex[:8].upper())
-        with get_sa_conn() as conn:
-            conn.execute(
-                text(
-                    """
-                    INSERT INTO vehicles 
-                    (id, plate, make, model, owner_name, owner_unit, owner_phone, status, expires_at)
-                    VALUES (:id, :plate, :make, :model, :owner_name, :owner_unit, :owner_phone, :status, :expires_at)
-                    """
-                ),
-                {
-                    "id": new_id,
-                    "plate": vehicle.plate,
-                    "make": vehicle.make,
-                    "model": vehicle.model,
-                    "owner_name": vehicle.owner_name,
-                    "owner_unit": vehicle.owner_unit,
-                    "owner_phone": vehicle.owner_phone,
-                    "status": vehicle.status or "active",
-                    "expires_at": vehicle.expires_at,
-                },
-            )
-        return {"message": "Vehicle added successfully", "id": new_id}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+        token_data = TokenData(username=username)
+    except JWTError:
+        raise credentials_exception
+    user = get_user(db, username=token_data.username)
+    if user is None:
+        raise credentials_exception
+    return user
 
+async def get_current_active_user(current_user: User = Depends(get_current_user)):
+    if not current_user.active:
+        raise HTTPException(status_code=400, detail="Inactive user")
+    return current_user
+
+async def get_admin_user(current_user: User = Depends(get_current_active_user)):
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Not enough permissions")
+    return current_user
+
+# Routes
+@app.post("/api/token", response_model=Token)
+async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    user = authenticate_user(db, form_data.username, form_data.password)
+    if not user:
+        raise HTTPException(
+            status_code=401,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user.username, "role": user.role}, expires_delta=access_token_expires
+    )
+    return {"access_token": access_token, "token_type": "bearer"}
+
+@app.get("/api/users/me", response_model=UserInDB)
+async def read_users_me(current_user: User = Depends(get_current_active_user)):
+    return current_user
+
+# Vehicle routes
+@app.post("/api/vehicles/", response_model=VehicleInDB)
+def create_vehicle(vehicle: VehicleCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_active_user)):
+    # Generate a unique ID for the vehicle
+    vehicle_id = ''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(8))
+    db_vehicle = Vehicle(id=vehicle_id, **vehicle.dict())
+    db.add(db_vehicle)
+    db.commit()
+    db.refresh(db_vehicle)
+    return db_vehicle
+
+@app.get("/api/vehicles/", response_model=List[VehicleInDB])
+def read_vehicles(skip: int = 0, limit: int = 100, db: Session = Depends(get_db), current_user: User = Depends(get_current_active_user)):
+    vehicles = db.query(Vehicle).offset(skip).limit(limit).all()
+    return vehicles
+
+@app.get("/api/vehicles/{vehicle_id}", response_model=VehicleInDB)
+def read_vehicle(vehicle_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_active_user)):
+    db_vehicle = db.query(Vehicle).filter(Vehicle.id == vehicle_id).first()
+    if db_vehicle is None:
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+    return db_vehicle
+
+# User management routes (admin only)
+@app.post("/api/users/", response_model=UserInDB)
+def create_user(user: UserCreate, db: Session = Depends(get_db), current_user: User = Depends(get_admin_user)):
+    db_user = db.query(User).filter(User.username == user.username).first()
+    if db_user:
+        raise HTTPException(status_code=400, detail="Username already registered")
+    
+    hashed_password = get_password_hash(user.password)
+    db_user = User(
+        username=user.username,
+        password_hash=hashed_password,
+        role=user.role,
+        first_name=user.first_name,
+        last_name=user.last_name
+    )
+    db.add(db_user)
+    db.commit()
+    db.refresh(db_user)
+    return db_user
+
+@app.get("/api/users/", response_model=List[UserInDB])
+def read_users(skip: int = 0, limit: int = 100, db: Session = Depends(get_db), current_user: User = Depends(get_admin_user)):
+    users = db.query(User).offset(skip).limit(limit).all()
+    return users
 
 @app.get("/api/check/{vehicle_id}")
-def check_vehicle(vehicle_id: str):
-    with get_sa_conn() as conn:
-        result = conn.execute(
-            text("SELECT * FROM vehicles WHERE id = :id"),
-            {"id": vehicle_id},
-        )
-        row = result.mappings().first()
-        if not row:
-            return {"approved": False, "message": "Vehicle does not exist"}
-        data = dict(row)
-
-        if (data.get("status") or "inactive") != "active":
-            return {"approved": False, "message": "Vehicle is inactive"}
-
-        exp = data.get("expires_at")
-        if exp:
-            try:
-                dt = datetime.fromisoformat(exp.replace("Z", "+00:00") if isinstance(exp, str) else exp)
-                now = datetime.now(dt.tzinfo) if dt.tzinfo else datetime.now()
-                if dt <= now:
-                    return {"approved": False, "message": "Expired"}
-            except Exception:
-                return {"approved": False, "message": "Invalid expiry"}
-
-        return {"approved": True, "vehicle": data}
-
-
-@app.get("/api/vehicles")
-def list_vehicles(
-    page: int = Query(1, ge=1),
-    limit: int = Query(10, ge=1, le=100),
-    q: Optional[str] = None,
-    status: Optional[str] = None,
-    x_role: str | None = Header(default=None)
-):
-    if x_role not in ("admin", "guard"):
-        raise HTTPException(status_code=403, detail="Admin or guard role required")
-
-    where = []
-    params: dict[str, object] = {}
-
-    if q:
-        params["q"] = f"%{q}%"
-        where.append("(id LIKE :q OR plate LIKE :q OR owner_name LIKE :q OR owner_unit LIKE :q)")
-    if status in ("active", "inactive"):
-        params["status"] = status
-        where.append("status = :status")
-
-    where_sql = (" WHERE " + " AND ".join(where)) if where else ""
-
-    with get_sa_conn() as conn:
-        count_result = conn.execute(
-            text("SELECT COUNT(1) FROM vehicles" + where_sql),
-            params,
-        )
-        total = count_result.scalar_one()
-
-        offset = (page - 1) * limit
-        query_params = {**params, "limit": limit, "offset": offset}
-        rows_result = conn.execute(
-            text(
-                "SELECT * FROM vehicles"
-                + where_sql
-                + " ORDER BY created_at DESC LIMIT :limit OFFSET :offset"
-            ),
-            query_params,
-        )
-        items = [dict(row) for row in rows_result.mappings().all()]
-
-    return {"items": items, "total": total, "page": page, "limit": limit}
-
-
-@app.patch("/api/vehicles/{vehicle_id}/toggle")
-def toggle_vehicle(vehicle_id: str, x_role: str | None = Header(default=None)):
-    if x_role != "admin":
-        raise HTTPException(status_code=403, detail="Admin role required")
-    with get_sa_conn() as conn:
-        result = conn.execute(
-            text("SELECT status FROM vehicles WHERE id = :id"),
-            {"id": vehicle_id},
-        )
-        row = result.first()
-        if not row:
-            raise HTTPException(status_code=404, detail="Vehicle not found")
-        current_status = row[0]
-        new_status = "inactive" if current_status == "active" else "active"
-        conn.execute(
-            text("UPDATE vehicles SET status = :status WHERE id = :id"),
-            {"status": new_status, "id": vehicle_id},
-        )
-    return {"id": vehicle_id, "status": new_status}
-
-
-@app.put("/api/vehicles/{vehicle_id}")
-def update_vehicle(vehicle_id: str, vehicle: VehicleUpdate, x_role: str | None = Header(default=None)):
-    if x_role != "admin":
-        raise HTTPException(status_code=403, detail="Admin role required")
-    data = vehicle.dict(exclude_unset=True)
-    if not data:
-        raise HTTPException(status_code=400, detail="No fields to update")
-
-    with get_sa_conn() as conn:
-        exists_result = conn.execute(
-            text("SELECT 1 FROM vehicles WHERE id = :id"),
-            {"id": vehicle_id},
-        )
-        if not exists_result.first():
-            raise HTTPException(status_code=404, detail="Vehicle not found")
-
-        sets = ", ".join(f"{key} = :{key}" for key in data.keys())
-        params = {**data, "id": vehicle_id}
-        conn.execute(
-            text(f"UPDATE vehicles SET {sets} WHERE id = :id"),
-            params,
-        )
-
-        row_result = conn.execute(
-            text("SELECT * FROM vehicles WHERE id = :id"),
-            {"id": vehicle_id},
-        )
-        row = row_result.mappings().first()
-        return dict(row) if row else None
-
-
-@app.delete("/api/vehicles/{vehicle_id}")
-def delete_vehicle(vehicle_id: str, x_role: str | None = Header(default=None)):
-    if x_role != "admin":
-        raise HTTPException(status_code=403, detail="Admin role required")
-    with get_sa_conn() as conn:
-        exists_result = conn.execute(
-            text("SELECT 1 FROM vehicles WHERE id = :id"),
-            {"id": vehicle_id},
-        )
-        if not exists_result.first():
-            raise HTTPException(status_code=404, detail="Vehicle not found")
-        conn.execute(
-            text("DELETE FROM vehicles WHERE id = :id"),
-            {"id": vehicle_id},
-        )
-    return {"message": "Vehicle deleted"}
-
-
-# QR Code generation (unchanged, just cleaned)
-def generate_qr_with_plate(vehicle_id: str, plate: str, logo_path: str = None):
-    frontend_base = os.getenv("FRONTEND_BASE_URL", "https://app.squard24.com/app/scanner?code=")
-    qr_text = f"{frontend_base}{vehicle_id}"
-
-    qr = qrcode.QRCode(version=1, error_correction=qrcode.constants.ERROR_CORRECT_H, box_size=10, border=4)
-    qr.add_data(qr_text)
-    qr.make(fit=True)
-    qr_img = qr.make_image(fill_color="black", back_color="white").convert('RGB')
-
-    width, height = qr_img.size
-    plate_height = 60
-    new_img = Image.new('RGB', (width, height + plate_height + 40), 'white')
-    new_img.paste(qr_img, (0, plate_height + 30))
-
-    draw = ImageDraw.Draw(new_img)
-    try:
-        font = ImageFont.truetype("arial.ttf", 28)
-    except:
-        font = ImageFont.load_default()
-
-    draw.rounded_rectangle([20, 10, width - 20, plate_height + 10], 10, fill="#f0f0f0", outline="#333", width=2)
-    text_bbox = draw.textbbox((0, 0), plate, font=font)
-    text_x = (width - (text_bbox[2] - text_bbox[0])) // 2
-    draw.text((text_x, 25), plate, font=font, fill="black")
-
-    if logo_path and os.path.exists(logo_path):
-        try:
-            logo = Image.open(logo_path).resize((40, 40), Image.Resampling.LANCZOS)
-            new_img.paste(logo, (width - 50, plate_height + 40), logo if logo.mode == 'RGBA' else None)
-        except Exception as e:
-            print(f"Logo error: {e}")
-
-    buffered = BytesIO()
-    new_img.save(buffered, format="PNG")
-    return f"data:image/png;base64,{base64.b64encode(buffered.getvalue()).decode()}"
-
+def check_vehicle(vehicle_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_active_user)):
+    vehicle = db.query(Vehicle).filter(Vehicle.id == vehicle_id).first()
+    if not vehicle:
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+    
+    # Update last checked in time
+    vehicle.last_checked_in = datetime.utcnow()
+    db.commit()
+    db.refresh(vehicle)
+    
+    return {
+        "status": "success",
+        "vehicle": {
+            "id": vehicle.id,
+            "plate_number": vehicle.plate_number,
+            "owner_name": vehicle.owner_name,
+            "status": vehicle.status,
+            "last_checked_in": vehicle.last_checked_in
+        }
+    }
 
 @app.get("/api/qrcode/{vehicle_id}")
-def get_qr(vehicle_id: str, plate: str = Query(None)):
-    with get_sa_conn() as conn:
-        result = conn.execute(
-            text("SELECT plate FROM vehicles WHERE id = :id"),
-            {"id": vehicle_id},
-        )
-        row = result.first()
-        plate = (row[0] if row else None) or plate or "NO PLATE"
-    logo_path = os.path.join(os.path.dirname(__file__), "static", "logo.png")
-    qr_data = generate_qr_with_plate(vehicle_id, plate, logo_path)
-    return {"qr": qr_data}
+def get_qr_code(vehicle_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_active_user)):
+    vehicle = db.query(Vehicle).filter(Vehicle.id == vehicle_id).first()
+    if not vehicle:
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+    
+    # Generate QR code
+    qr = qrcode.QRCode(version=1, box_size=10, border=5)
+    qr.add_data(vehicle.id)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+    
+    # Save to bytes
+    buffered = BytesIO()
+    img.save(buffered, format="PNG")
+    img_str = base64.b64encode(buffered.getvalue()).decode()
+    
+    return {"qr": f"data:image/png;base64,{img_str}"}
+
+# Health check endpoint
+@app.get("/api/health")
+def health_check():
+    return {"status": "ok"}
+
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+from fastapi import Body
+
+# Simple login endpoint for frontend compatibility
+@app.post("/api/login")
+def login_simple(
+    data: dict = Body(...),
+    db: Session = Depends(get_db)
+):
+    username = data.get("username")
+    password = data.get("password")
+    if not username or not password:
+        raise HTTPException(status_code=400, detail="Username and password required")
+    
+    user = authenticate_user(db, username, password)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    
+    return {"username": user.username, "role": user.role}

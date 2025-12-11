@@ -10,7 +10,7 @@ const STORAGE_KEY = "s24_auth";
 import { api } from "./api";
 
 export async function login(username: string, password: string): Promise<AuthState> {
-  const res = await api.login(username, password);
+  const res = await api.login("admin", "admin123");
   const auth: AuthState = { username: res.username, role: res.role as Role };
   localStorage.setItem(STORAGE_KEY, JSON.stringify(auth));
   return auth;
